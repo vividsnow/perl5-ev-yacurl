@@ -1,0 +1,282 @@
+name: CI
+
+on:
+  push:
+    branches: ['*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+
+  linux:
+    runs-on: ubuntu-latest
+    name: Linux - Perl ${{ matrix.perl }}
+    strategy:
+      fail-fast: false
+      matrix:
+        perl: ['5.26', '5.32', '5.36', '5.40']
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: ${{ matrix.perl }}
+
+      - name: Install system deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libcurl4-openssl-dev
+
+      - name: Install Perl deps
+        run: cpanm -n EV EV::MakeMaker Alien::curl Test::LeakTrace
+
+      - name: Build and test
+        run: perl Makefile.PL && make && make test
+
+  linux-alien-share:
+    runs-on: ubuntu-latest
+    name: Linux - Alien::curl share build
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.40'
+
+      - name: Install system deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libssl-dev libpsl-dev zlib1g-dev
+
+      - name: Install Perl deps
+        run: |
+          cpanm -n EV EV::MakeMaker Test::LeakTrace
+          ALIEN_INSTALL_TYPE=share cpanm -n Alien::curl \
+            || { cat ~/.cpanm/work/*/build.log; exit 1; }
+
+      - name: Build and test
+        run: perl Makefile.PL && make && make test
+
+  dist:
+    runs-on: ubuntu-latest
+    name: Linux - dist sanity
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.40'
+
+      - name: Install system deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libcurl4-openssl-dev
+
+      - name: Install Perl deps
+        run: cpanm -n EV EV::MakeMaker Alien::curl Test::LeakTrace
+
+      - name: MANIFEST is complete
+        run: |
+          perl Makefile.PL
+          make manifest 2>&1 | tee "$RUNNER_TEMP/manifest.log"
+          ! grep -q '^Added to MANIFEST' "$RUNNER_TEMP/manifest.log"
+          git diff --exit-code MANIFEST
+
+      - name: disttest
+        run: make disttest
+
+      - name: Author tests
+        env:
+          RELEASE_TESTING: 1
+        run: |
+          cpanm -n Test::Pod
+          make
+          prove -b xt/pod.t xt/examples.t
+
+      - name: Kwalitee
+        run: |
+          cpanm -n Module::CPANTS::Analyse
+          make dist
+          perl -MModule::CPANTS::Analyse -e '
+            my $a = Module::CPANTS::Analyse->new({ dist => $ARGV[0] });
+            $a->unpack; $a->analyse; $a->calc_kwalitee;
+            my $k = $a->d->{kwalitee};
+            my @failed = grep { !$k->{$_} && $_ ne q(kwalitee) } sort keys %$k;
+            print "kwalitee $k->{kwalitee}\n";
+            die "failed metrics: @failed\n" if @failed;
+          ' EV-YACurl-*.tar.gz
+
+  valgrind:
+    runs-on: ubuntu-latest
+    name: Linux - valgrind
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.40'
+
+      - name: Install system deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libcurl4-openssl-dev valgrind
+
+      - name: Install Perl deps
+        run: cpanm -n EV EV::MakeMaker Alien::curl Test::LeakTrace
+
+      - name: Build
+        run: perl Makefile.PL && make
+
+      - name: Run the suite under valgrind
+        env:
+          EV_YACURL_VALGRIND: 1
+        run: prove -bv xt/valgrind.t
+
+  libcurl:
+    runs-on: ubuntu-latest
+    name: libcurl ${{ matrix.libcurl }} (${{ matrix.image }})
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest 7 series still packaged, the last of the 7 series, and a
+          # current 8. The declared floor is 7.64.0.
+          - { image: 'debian:bullseye', libcurl: '7.74' }
+          - { image: 'debian:bookworm', libcurl: '7.88' }
+          - { image: 'debian:trixie',   libcurl: '8.x'  }
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system deps
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            perl libperl-dev make gcc libcurl4-openssl-dev pkg-config curl \
+            cpanminus ca-certificates
+
+      - name: Report the libcurl actually in use
+        run: curl-config --version && curl-config --features
+
+      # Alien::curl probes at configure time, so its own prerequisites have to
+      # be in place first or the probe cannot run. ALIEN_INSTALL_TYPE=system
+      # then makes a failed probe an error instead of a silent source build of
+      # a modern curl, which would leave this matrix testing nothing.
+      - name: Install Perl deps
+        run: |
+          cpanm -n EV EV::MakeMaker Test::LeakTrace
+          cpanm -n Env::ShellWords FFI::CheckLib Alien::Build Alien::Build::MM
+          ALIEN_INSTALL_TYPE=system cpanm -n Alien::curl \
+            || { echo '--- cpanm build.log ---'; cat "$(ls -t ~/.cpanm/work/*/build.log | head -1)"; exit 1; }
+
+      - name: Confirm the system libcurl is the one in use
+        run: |
+          perl -MAlien::curl -e 'printf "install_type=%s version=%s\n", Alien::curl->install_type, Alien::curl->version; exit(Alien::curl->install_type eq q(system) ? 0 : 1)'
+
+      - name: Build and test
+        run: perl Makefile.PL && make && make test
+
+  alpine:
+    runs-on: ubuntu-latest
+    name: Alpine (musl)
+    container: alpine:latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system deps
+        run: |
+          apk add --no-cache perl perl-dev make gcc musl-dev \
+            curl-dev curl pkgconf wget git
+
+      - name: Install Perl deps
+        run: |
+          wget -qO- https://cpanmin.us | perl - App::cpanminus
+          cpanm -n EV EV::MakeMaker Alien::curl Test::LeakTrace
+
+      - name: Build and test
+        run: perl Makefile.PL && make && make test
+
+  macos:
+    runs-on: macos-latest
+    name: macOS - Perl ${{ matrix.perl }}
+    strategy:
+      fail-fast: false
+      matrix:
+        perl: ['5.36', '5.40']
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: ${{ matrix.perl }}
+
+      - name: Install system deps
+        run: brew install pkgconf curl
+
+      # Alien::curl probes with pkg-config and then confirms the find with
+      # FFI::CheckLib, which cannot see macOS system libraries in the dyld
+      # cache; point all three at the keg-only brew build.
+      - name: Set up environment
+        run: |
+          prefix="$(brew --prefix curl)"
+          {
+            echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig"
+            echo "FFI_CHECKLIB_PATH=$prefix/lib"
+            echo "DYLD_FALLBACK_LIBRARY_PATH=$prefix/lib"
+          } >> "$GITHUB_ENV"
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+
+      - name: Install Perl deps
+        run: |
+          cpanm -n EV EV::MakeMaker Test::LeakTrace
+          cpanm -n Alien::curl || { cat ~/.cpanm/work/*/build.log; exit 1; }
+
+      - name: Build and test
+        run: perl Makefile.PL && make && make test
+
+  freebsd:
+    runs-on: ubuntu-latest
+    name: FreeBSD
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y perl5 curl gmake pkgconf p5-EV p5-App-cpanminus
+            cpanm -n EV::MakeMaker Alien::curl Test::LeakTrace
+          run: |
+            perl Makefile.PL
+            gmake
+            gmake test
+
+  openbsd:
+    runs-on: ubuntu-latest
+    name: OpenBSD
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: vmactions/openbsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg_add curl pkgconf p5-EV
+            curl -L https://cpanmin.us | perl - App::cpanminus
+            FFI_CHECKLIB_PATH=/usr/local/lib \
+              cpanm -n EV::MakeMaker Alien::curl Test::LeakTrace \
+              || { cat /root/.cpanm/work/*/build.log; exit 1; }
+          run: |
+            perl Makefile.PL
+            make
+            make test
+  netbsd:
+    runs-on: ubuntu-latest
+    name: NetBSD
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: vmactions/netbsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            /usr/sbin/pkg_add pkgin
+            pkgin -y install gmake pkgconf curl p5-EV p5-App-cpanminus
+            cpanm -n EV::MakeMaker Alien::curl Test::LeakTrace
+          run: |
+            curl-config --version
+            perl Makefile.PL
+            gmake
+            gmake test
